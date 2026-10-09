@@ -70,19 +70,42 @@ import {
 export const fsRouter = new Hono()
 fsRouter.route("/seed", seedRouter)
 
+/**
+ * 请求级存储上下文（`env` + `waitUntil`）。
+ *
+ * 关键约定：**`env` 必须始终传递**，与 executionCtx 是否可用无关。
+ *
+ * singleflight（`SINGLEFLIGHT=db`）依赖它来解析协调用的 SQL 驱动：拿不到 `env`
+ * 时 `getStorageBackend(undefined)` 会解析成**内存驱动**，`supportsSql()` 为假，
+ * 于是 `auto` 静默退回内存级 —— 单飞退化成仅进程内合并，**跨实例协调能力被
+ * 静默丢弃**，而日志里看不到任何异常。
+ *
+ * 真正依赖 executionCtx 的只有 `waitUntil`；缺失时降级为同步等待
+ * （见 `scheduleStoragePersistence`），业务语义不变。
+ */
+let warnedMissingExecutionCtx = false
 const getStorageRequestContext = (c: any) => {
+  const env = c?.env
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined
   try {
-    const executionCtx = c.executionCtx
-    if (!executionCtx || typeof executionCtx.waitUntil !== "function") {
-      return undefined
-    }
-    return {
-      waitUntil: (promise: Promise<unknown>) => executionCtx.waitUntil(promise),
-      env: c.env, // 传递 env 用于请求级 KV 缓存复用
+    const executionCtx = c?.executionCtx
+    if (executionCtx && typeof executionCtx.waitUntil === "function") {
+      waitUntil = (promise: Promise<unknown>) => executionCtx.waitUntil(promise)
     }
   } catch {
-    return undefined
+    // executionCtx 可能是访问即抛错的对象：按「不可用」处理，但 env 照常传递
+    waitUntil = undefined
   }
+  if (!waitUntil && !warnedMissingExecutionCtx) {
+    warnedMissingExecutionCtx = true
+    console.warn(
+      "[fs] executionCtx.waitUntil is unavailable in this runtime; deferred " +
+        "storage persistence will be awaited inline instead of being scheduled " +
+        "in the background.",
+    )
+  }
+  if (!env && !waitUntil) return undefined
+  return { ...(waitUntil ? { waitUntil } : {}), env }
 }
 
 // ---- 写操作权限校验 ----
